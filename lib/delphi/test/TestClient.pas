@@ -25,11 +25,12 @@ unit TestClient;
 interface
 
 uses
-  Windows, SysUtils, Classes,
+  Windows, SysUtils, Classes, Math,
   DateUtils,
   Generics.Collections,
   TestConstants,
   Thrift,
+  Thrift.Protocol.Compact,
   Thrift.Protocol.JSON,
   Thrift.Protocol,
   Thrift.Transport.Pipes,
@@ -77,10 +78,11 @@ type
     procedure StartTestGroup( const aGroup : string; const aTest : TTestGroup);
     procedure Expect( aTestResult : Boolean; const aTestInfo : string);
     procedure ReportResults;
-    function CalculateExitCode : Byte;
+    function  CalculateExitCode : Byte;
 
     procedure ClientTest;
     procedure JSONProtocolReadWriteTest;
+    function  PrepareBinaryData( aRandomDist : Boolean = FALSE) : TBytes;
     {$IFDEF StressTest}
     procedure StressTest(const client : TThriftTest.Iface);
     {$ENDIF}
@@ -351,7 +353,7 @@ begin
       case protType of
         prot_Binary  :  prot := TBinaryProtocolImpl.Create( trans, BINARY_STRICT_READ, BINARY_STRICT_WRITE);
         prot_JSON    :  prot := TJSONProtocolImpl.Create( trans);
-        prot_Compact :  raise Exception.Create('Compact protocol not implemented');
+        prot_Compact :  prot := TCompactProtocolImpl.Create( trans);
       else
         raise Exception.Create('Unhandled protocol');
       end;
@@ -394,6 +396,7 @@ var
   i8 : ShortInt;
   i32 : Integer;
   i64 : Int64;
+  binOut,binIn : TBytes;
   dub : Double;
   o : IXtruct;
   o2 : IXtruct2;
@@ -479,17 +482,18 @@ begin
   except
     on e:TTransportException do begin
       Console.WriteLine( e.ClassName+' = '+e.Message); // this is what we get
-      if FTransport.IsOpen then FTransport.Close;
-      FTransport.Open;   // re-open connection, server has already closed
     end;
     on e:TApplicationException do begin
       Console.WriteLine( e.ClassName+' = '+e.Message); // this is what we get
-      if FTransport.IsOpen then FTransport.Close;
-      FTransport.Open;   // re-open connection, server has already closed
     end;
     on e:TException do Expect( FALSE, 'Unexpected exception type "'+e.ClassName+'"');
     on e:Exception do Expect( FALSE, 'Unexpected exception type "'+e.ClassName+'"');
   end;
+
+  {
+  if FTransport.IsOpen then FTransport.Close;
+  FTransport.Open;   // re-open connection, server has already closed
+  }
 
   // case 3: no exception
   try
@@ -505,6 +509,11 @@ begin
   StartTestGroup( 'simple Thrift calls', test_BaseTypes);
   client.testVoid();
   Expect( TRUE, 'testVoid()');  // success := no exception
+
+  s := BoolToString( client.testBool(TRUE));
+  Expect( s = BoolToString(TRUE),  'testBool(TRUE) = '+s);
+  s := BoolToString( client.testBool(FALSE));
+  Expect( s = BoolToString(FALSE),  'testBool(FALSE) = '+s);
 
   s := client.testString('Test');
   Expect( s = 'Test', 'testString(''Test'') = "'+s+'"');
@@ -523,6 +532,18 @@ begin
   Console.WriteLine('testI64(-34359738368)');
   i64 := client.testI64(-34359738368);
   Expect( i64 = -34359738368, 'testI64(-34359738368) = ' + IntToStr( i64));
+
+  binOut := PrepareBinaryData( TRUE);
+  Console.WriteLine('testBinary('+BytesToHex(binOut)+')');
+  try
+    binIn := client.testBinary(binOut);
+    Expect( Length(binOut) = Length(binIn), 'testBinary(): length '+IntToStr(Length(binOut))+' = '+IntToStr(Length(binIn)));
+    i32 := Min( Length(binOut), Length(binIn));
+    Expect( CompareMem( binOut, binIn, i32), 'testBinary('+BytesToHex(binOut)+') = '+BytesToHex(binIn));
+  except
+    on e:TApplicationException do Console.WriteLine('testBinary(): '+e.Message);
+    on e:Exception do Expect( FALSE, 'testBinary(): Unexpected exception "'+e.ClassName+'": '+e.Message);
+  end;
 
   Console.WriteLine('testDouble(5.325098235)');
   dub := client.testDouble(5.325098235);
@@ -961,6 +982,34 @@ begin
 end;
 {$ENDIF}
 
+
+function TClientThread.PrepareBinaryData( aRandomDist : Boolean = FALSE) : TBytes;
+var i, nextPos : Integer;
+begin
+  SetLength( result, $100);
+  ASSERT( Low(result) = 0);
+
+  // linear distribution, unless random is requested
+  if not aRandomDist then begin
+    for i := Low(result) to High(result) do begin
+      result[i] := i;
+    end;
+    Exit;
+  end;
+
+  // random distribution of all 256 values
+  FillChar( result[0], Length(result) * SizeOf(result[0]), $0);
+  i := 1;
+  while i < Length(result) do begin
+    nextPos := Byte( Random($100));
+    if result[nextPos] = 0 then begin  // unused?
+      result[nextPos] := i;
+      Inc(i);
+    end;
+  end;
+end;
+
+
 procedure TClientThread.JSONProtocolReadWriteTest;
 // Tests only then read/write procedures of the JSON protocol
 // All tests succeed, if we can read what we wrote before
@@ -979,9 +1028,9 @@ const
   TEST_DOUBLE  = -1.234e-56;
   DELTA_DOUBLE = TEST_DOUBLE * 1e-14;
   TEST_STRING  = 'abc-'#$00E4#$00f6#$00fc; // german umlauts (en-us: "funny chars")
-  // Test THRIFT-2336 with 'Русское Название';
-  RUSSIAN_TEXT = #$0420#$0443#$0441#$0441#$043a#$043e#$0435' '#$041d#$0430#$0437#$0432#$0430#$043d#$0438#$0435;
-  RUSSIAN_JSON = '"\u0420\u0443\u0441\u0441\u043a\u043e\u0435 \u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435"';
+  // Test THRIFT-2336 and THRIFT-3404 with U+1D11E (G Clef symbol) and 'Русское Название';
+  G_CLEF_AND_CYRILLIC_TEXT = #$1d11e' '#$0420#$0443#$0441#$0441#$043a#$043e#$0435' '#$041d#$0430#$0437#$0432#$0430#$043d#$0438#$0435;
+  G_CLEF_AND_CYRILLIC_JSON = '"\ud834\udd1e \u0420\u0443\u0441\u0441\u043a\u043e\u0435 \u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435"';
   // test both possible solidus encodings
   SOLIDUS_JSON_DATA = '"one/two\/three"';
   SOLIDUS_EXCPECTED = 'one/two/three';
@@ -991,8 +1040,7 @@ begin
     StartTestGroup( 'JsonProtocolTest', test_Unknown);
 
     // prepare binary data
-    SetLength( binary, $100);
-    for i := Low(binary) to High(binary) do binary[i] := i;
+    binary := PrepareBinaryData( FALSE);
 
     // output setup
     prot := TJSONProtocolImpl.Create(
@@ -1069,22 +1117,22 @@ begin
     prot := TJSONProtocolImpl.Create(
               TStreamTransportImpl.Create(
                 nil, TThriftStreamAdapterDelphi.Create( stm, FALSE)));
-    prot.WriteString( RUSSIAN_TEXT);
+    prot.WriteString( G_CLEF_AND_CYRILLIC_TEXT);
     stm.Position := 0;
     prot := TJSONProtocolImpl.Create(
               TStreamTransportImpl.Create(
                 TThriftStreamAdapterDelphi.Create( stm, FALSE), nil));
-    Expect( prot.ReadString = RUSSIAN_TEXT, 'Writing JSON with chars > 8 bit');
+    Expect( prot.ReadString = G_CLEF_AND_CYRILLIC_TEXT, 'Writing JSON with chars > 8 bit');
 
     // Widechars should work with hex-encoding too. Do they?
     stm.Position := 0;
     stm.Size     := 0;
-    stm.WriteString( RUSSIAN_JSON);
+    stm.WriteString( G_CLEF_AND_CYRILLIC_JSON);
     stm.Position := 0;
     prot := TJSONProtocolImpl.Create(
               TStreamTransportImpl.Create(
                 TThriftStreamAdapterDelphi.Create( stm, FALSE), nil));
-    Expect( prot.ReadString = RUSSIAN_TEXT, 'Reading JSON with chars > 8 bit');
+    Expect( prot.ReadString = G_CLEF_AND_CYRILLIC_TEXT, 'Reading JSON with chars > 8 bit');
 
 
   finally

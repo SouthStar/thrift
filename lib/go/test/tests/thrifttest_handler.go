@@ -56,6 +56,10 @@ func (p *ThriftTestHandler) TestString(thing string) (r string, err error) {
 	return thing, nil
 }
 
+func (p *ThriftTestHandler) TestBool(thing bool) (r bool, err error) {
+	return thing, nil
+}
+
 func (p *ThriftTestHandler) TestByte(thing int8) (r int8, err error) {
 	return thing, nil
 }
@@ -69,6 +73,10 @@ func (p *ThriftTestHandler) TestI64(thing int64) (r int64, err error) {
 }
 
 func (p *ThriftTestHandler) TestDouble(thing float64) (r float64, err error) {
+	return thing, nil
+}
+
+func (p *ThriftTestHandler) TestBinary(thing []byte) (r []byte, err error) {
 	return thing, nil
 }
 

@@ -29,6 +29,10 @@
 
 #include <iostream>
 
+#ifdef HAVE_SYS_SELECT_H
+#include <sys/select.h>
+#endif
+
 #ifdef HAVE_SYS_SOCKET_H
 #include <sys/socket.h>
 #endif
@@ -63,6 +67,10 @@
 #if !defined(PRIu32)
 #define PRIu32 "I32u"
 #define PRIu64 "I64u"
+#endif
+
+#if defined(_WIN32) && (_WIN32_WINNT < 0x0600)
+  #define AI_ADDRCONFIG 0x0400
 #endif
 
 namespace apache {
@@ -283,6 +291,7 @@ public:
   void forceClose() {
     appState_ = APP_CLOSE_CONNECTION;
     if (!notifyIOThread()) {
+      close();
       throw TException("TConnection::forceClose: failed write on notify pipe");
     }
   }
@@ -342,6 +351,8 @@ public:
 
     // Signal completion back to the libevent thread via a pipe
     if (!connection_->notifyIOThread()) {
+      GlobalOutput.printf("TNonblockingServer: failed to notifyIOThread, closing.");
+      connection_->close();
       throw TException("TNonblockingServer::Task::run: failed write on notify pipe");
     }
   }
@@ -385,8 +396,14 @@ void TNonblockingServer::TConnection::init(THRIFT_SOCKET socket,
   factoryOutputTransport_ = server_->getOutputTransportFactory()->getTransport(outputTransport_);
 
   // Create protocol
-  inputProtocol_ = server_->getInputProtocolFactory()->getProtocol(factoryInputTransport_);
-  outputProtocol_ = server_->getOutputProtocolFactory()->getProtocol(factoryOutputTransport_);
+  if (server_->getHeaderTransport()) {
+    inputProtocol_ = server_->getInputProtocolFactory()->getProtocol(factoryInputTransport_,
+                                                                     factoryOutputTransport_);
+    outputProtocol_ = inputProtocol_;
+  } else {
+    inputProtocol_ = server_->getInputProtocolFactory()->getProtocol(factoryInputTransport_);
+    outputProtocol_ = server_->getOutputProtocolFactory()->getProtocol(factoryOutputTransport_);
+  }
 
   // Set up for any server event handler
   serverEventHandler_ = server_->getEventHandler();
@@ -528,6 +545,13 @@ void TNonblockingServer::TConnection::workSocket() {
   }
 }
 
+bool TNonblockingServer::getHeaderTransport() {
+  // Currently if there is no output protocol factory,
+  // we assume header transport (without having to create
+  // a new transport and check)
+  return getOutputProtocolFactory() == NULL;
+}
+
 /**
  * This is called when the application transitions from one state into
  * another. This means that it has finished writing the data that it needed
@@ -544,12 +568,20 @@ void TNonblockingServer::TConnection::transition() {
   case APP_READ_REQUEST:
     // We are done reading the request, package the read buffer into transport
     // and get back some data from the dispatch function
-    inputTransport_->resetBuffer(readBuffer_, readBufferPos_);
-    outputTransport_->resetBuffer();
-    // Prepend four bytes of blank space to the buffer so we can
-    // write the frame size there later.
-    outputTransport_->getWritePtr(4);
-    outputTransport_->wroteBytes(4);
+    if (server_->getHeaderTransport()) {
+      inputTransport_->resetBuffer(readBuffer_, readBufferPos_);
+      outputTransport_->resetBuffer();
+    } else {
+      // We saved room for the framing size in case header transport needed it,
+      // but just skip it for the non-header case
+      inputTransport_->resetBuffer(readBuffer_ + 4, readBufferPos_ - 4);
+      outputTransport_->resetBuffer();
+
+      // Prepend four bytes of blank space to the buffer so we can
+      // write the frame size there later.
+      outputTransport_->getWritePtr(4);
+      outputTransport_->wroteBytes(4);
+    }
 
     server_->incrementActiveProcessors();
 
@@ -567,6 +599,9 @@ void TNonblockingServer::TConnection::transition() {
       } catch (IllegalStateException& ise) {
         // The ThreadManager is not ready to handle any more tasks (it's probably shutting down).
         GlobalOutput.printf("IllegalStateException: Server::process() %s", ise.what());
+        close();
+      } catch (TimedOutException& to) {
+        GlobalOutput.printf("[ERROR] TimedOutException: Server::process() %s", to.what());
         close();
       }
 
@@ -681,6 +716,8 @@ void TNonblockingServer::TConnection::transition() {
     return;
 
   case APP_READ_FRAME_SIZE:
+    readWant_ += 4;
+
     // We just read the request length
     // Double the buffer size until it is big enough
     if (readWant_ > readBufferSize_) {
@@ -701,7 +738,8 @@ void TNonblockingServer::TConnection::transition() {
       readBufferSize_ = newSize;
     }
 
-    readBufferPos_ = 0;
+    readBufferPos_ = 4;
+    *((uint32_t*)readBuffer_) = htonl(readWant_ - 4);
 
     // Move into read request state
     socketState_ = SOCKET_RECV;
@@ -969,7 +1007,10 @@ void TNonblockingServer::handleEvent(THRIFT_SOCKET fd, short which) {
     if (clientConnection->getIOThreadNumber() == 0) {
       clientConnection->transition();
     } else {
-      clientConnection->notifyIOThread();
+      if (!clientConnection->notifyIOThread()) {
+        GlobalOutput.perror("[ERROR] notifyIOThread failed on fresh connection, closing", errno);
+        returnConnection(clientConnection);
+      }
     }
 
     // addrLen is written by the accept() call, so needs to be set before the next call.
@@ -987,6 +1028,10 @@ void TNonblockingServer::handleEvent(THRIFT_SOCKET fd, short which) {
  * Creates a socket to listen on and binds it to the local port.
  */
 void TNonblockingServer::createAndListenOnSocket() {
+#ifdef _WIN32
+  TWinsockSingleton::create();
+#endif // _WIN32
+
   THRIFT_SOCKET s;
 
   struct addrinfo hints, *res, *res0;
@@ -1090,6 +1135,22 @@ void TNonblockingServer::listenSocket(THRIFT_SOCKET s) {
 
   // Cool, this socket is good to go, set it as the serverSocket_
   serverSocket_ = s;
+
+  if (!port_) {
+    struct sockaddr_storage addr;
+    socklen_t size = sizeof(addr);
+    if (!getsockname(serverSocket_, reinterpret_cast<sockaddr*>(&addr), &size)) {
+      if (addr.ss_family == AF_INET6) {
+        const struct sockaddr_in6* sin = reinterpret_cast<const struct sockaddr_in6*>(&addr);
+        listenPort_ = ntohs(sin->sin6_port);
+      } else {
+        const struct sockaddr_in* sin = reinterpret_cast<const struct sockaddr_in*>(&addr);
+        listenPort_ = ntohs(sin->sin_port);
+      }
+    } else {
+      GlobalOutput.perror("TNonblocking: failed to get listen port: ", THRIFT_GET_SOCKET_ERROR);
+    }
+  }
 }
 
 void TNonblockingServer::setThreadManager(boost::shared_ptr<ThreadManager> threadManager) {
@@ -1148,6 +1209,9 @@ void TNonblockingServer::expireClose(boost::shared_ptr<Runnable> task) {
 }
 
 void TNonblockingServer::stop() {
+  if (!port_) {
+    listenPort_ = 0;
+  }
   // Breaks the event loop in all threads so that they end ASAP.
   for (uint32_t i = 0; i < ioThreads_.size(); ++i) {
     ioThreads_[i]->stop();
@@ -1166,6 +1230,8 @@ void TNonblockingServer::registerEvents(event_base* user_event_base) {
   if (!numIOThreads_) {
     numIOThreads_ = DEFAULT_IO_THREADS;
   }
+  // User-provided event-base doesn't works for multi-threaded servers
+  assert(numIOThreads_ == 1 || !userEventBase_);
 
   for (uint32_t id = 0; id < numIOThreads_; ++id) {
     // the first IO thread also does the listening on server socket
@@ -1187,13 +1253,13 @@ void TNonblockingServer::registerEvents(event_base* user_event_base) {
   assert(ioThreads_.size() > 0);
 
   GlobalOutput.printf("TNonblockingServer: Serving on port %d, %d io threads.",
-                      port_,
+                      listenPort_,
                       ioThreads_.size());
 
   // Launch all the secondary IO threads in separate threads
   if (ioThreads_.size() > 1) {
     ioThreadFactory_.reset(new PlatformThreadFactory(
-#if !defined(USE_BOOST_THREAD) && !defined(USE_STD_THREAD)
+#if !USE_BOOST_THREAD && !USE_STD_THREAD
         PlatformThreadFactory::OTHER,  // scheduler
         PlatformThreadFactory::NORMAL, // priority
         1,                             // stack size (MB)
@@ -1221,7 +1287,8 @@ void TNonblockingServer::registerEvents(event_base* user_event_base) {
  */
 void TNonblockingServer::serve() {
 
-  registerEvents(NULL);
+  if (ioThreads_.empty())
+    registerEvents(NULL);
 
   // Run the primary (listener) IO thread loop in our main thread; this will
   // only return when the server is shutting down.
@@ -1368,9 +1435,42 @@ bool TNonblockingIOThread::notify(TNonblockingServer::TConnection* conn) {
     return false;
   }
 
-  const int kSize = sizeof(conn);
-  if (send(fd, const_cast_sockopt(&conn), kSize, 0) != kSize) {
-    return false;
+  fd_set wfds, efds;
+  int ret = -1;
+  int kSize = sizeof(conn);
+  const char* pos = (const char*)const_cast_sockopt(&conn);
+
+  while (kSize > 0) {
+    FD_ZERO(&wfds);
+    FD_ZERO(&efds);
+    FD_SET(fd, &wfds);
+    FD_SET(fd, &efds);
+    ret = select(fd + 1, NULL, &wfds, &efds, NULL);
+    if (ret < 0) {
+      return false;
+    } else if (ret == 0) {
+      continue;
+    }
+
+    if (FD_ISSET(fd, &efds)) {
+      ::THRIFT_CLOSESOCKET(fd);
+      return false;
+    }
+
+    if (FD_ISSET(fd, &wfds)) {
+      ret = send(fd, pos, kSize, 0);
+      if (ret < 0) {
+        if (errno == EAGAIN) {
+          continue;
+        }
+
+        ::THRIFT_CLOSESOCKET(fd);
+        return false;
+      }
+
+      kSize -= ret;
+      pos += ret;
+    }
   }
 
   return true;

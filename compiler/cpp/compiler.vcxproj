@@ -19,6 +19,7 @@
     </ProjectConfiguration>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="src\audit\t_audit.h" />
     <ClInclude Include="src\generate\t_generator.h" />
     <ClInclude Include="src\generate\t_generator_registry.h" />
     <ClInclude Include="src\generate\t_oop_generator.h" />
@@ -50,12 +51,14 @@
     <ClInclude Include="src\windows\version.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="src\audit\t_audit.cpp"/>
     <ClCompile Include="src\generate\t_as3_generator.cc" />
     <ClCompile Include="src\generate\t_cocoa_generator.cc" />
     <ClCompile Include="src\generate\t_cpp_generator.cc" />
     <ClCompile Include="src\generate\t_csharp_generator.cc" />
     <ClCompile Include="src\generate\t_c_glib_generator.cc" />
     <ClCompile Include="src\generate\t_d_generator.cc" />
+    <ClCompile Include="src\generate\t_dart_generator.cc" />
     <ClCompile Include="src\generate\t_delphi_generator.cc" />
     <ClCompile Include="src\generate\t_erl_generator.cc" />
     <ClCompile Include="src\generate\t_generator.cc" />
@@ -67,12 +70,16 @@
     <ClCompile Include="src\generate\t_javame_generator.cc" />
     <ClCompile Include="src\generate\t_java_generator.cc" />
     <ClCompile Include="src\generate\t_js_generator.cc" />
+    <ClCompile Include="src\generate\t_json_generator.cc" />
+    <ClCompile Include="src\generate\t_lua_generator.cc" />
     <ClCompile Include="src\generate\t_ocaml_generator.cc" />
     <ClCompile Include="src\generate\t_perl_generator.cc" />
     <ClCompile Include="src\generate\t_php_generator.cc" />
     <ClCompile Include="src\generate\t_py_generator.cc" />
     <ClCompile Include="src\generate\t_rb_generator.cc" />
     <ClCompile Include="src\generate\t_st_generator.cc" />
+	<ClCompile Include="src\generate\t_swift_generator.cc" />
+    <ClCompile Include="src\generate\t_xml_generator.cc" />
     <ClCompile Include="src\generate\t_xsd_generator.cc" />
     <ClCompile Include="src\main.cc" />
     <ClCompile Include="src\md5.c" />

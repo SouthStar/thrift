@@ -19,8 +19,15 @@
 
 #include <thrift/protocol/TJSONProtocol.h>
 
-#include <math.h>
+#include <limits>
+#include <locale>
+#include <sstream>
+#include <cmath>
+
+#include <boost/math/special_functions/fpclassify.hpp>
 #include <boost/lexical_cast.hpp>
+#include <boost/locale.hpp>
+
 #include <thrift/protocol/TBase64Utils.h>
 #include <thrift/transport/TTransportException.h>
 
@@ -279,6 +286,16 @@ static bool isJSONNumeric(uint8_t ch) {
   return false;
 }
 
+// Return true if the code unit is high surrogate
+static bool isHighSurrogate(uint16_t val) {
+  return val >= 0xD800 && val <= 0xDBFF;
+}
+
+// Return true if the code unit is low surrogate
+static bool isLowSurrogate(uint16_t val) {
+  return val >= 0xDC00 && val <= 0xDFFF;
+}
+
 /**
  * Class to serve as base JSON context and as base class for other context
  * implementations
@@ -503,30 +520,38 @@ uint32_t TJSONProtocol::writeJSONInteger(NumberType num) {
   return result;
 }
 
+namespace {
+std::string doubleToString(double d) {
+  std::ostringstream str;
+  str.imbue(std::locale::classic());
+  str.precision(std::numeric_limits<double>::digits10 + 1);
+  str << d;
+  return str.str();
+}
+}
+
 // Convert the given double to a JSON string, which is either the number,
 // "NaN" or "Infinity" or "-Infinity".
 uint32_t TJSONProtocol::writeJSONDouble(double num) {
   uint32_t result = context_->write(*trans_);
-  std::string val(boost::lexical_cast<std::string>(num));
+  std::string val;
 
-  // Normalize output of boost::lexical_cast for NaNs and Infinities
   bool special = false;
-  switch (val[0]) {
-  case 'N':
-  case 'n':
+  switch (boost::math::fpclassify(num)) {
+  case FP_INFINITE:
+    if (boost::math::signbit(num)) {
+      val = kThriftNegativeInfinity;
+    } else {
+      val = kThriftInfinity;
+    }
+    special = true;
+    break;
+  case FP_NAN:
     val = kThriftNan;
     special = true;
     break;
-  case 'I':
-  case 'i':
-    val = kThriftInfinity;
-    special = true;
-    break;
-  case '-':
-    if ((val[1] == 'I') || (val[1] == 'i')) {
-      val = kThriftNegativeInfinity;
-      special = true;
-    }
+  default:
+    val = doubleToString(num);
     break;
   }
 
@@ -695,14 +720,17 @@ uint32_t TJSONProtocol::readJSONSyntaxChar(uint8_t ch) {
 }
 
 // Decodes the four hex parts of a JSON escaped string character and returns
-// the character via out. The first two characters must be "00".
-uint32_t TJSONProtocol::readJSONEscapeChar(uint8_t* out) {
-  uint8_t b[2];
-  readJSONSyntaxChar(kJSONZeroChar);
-  readJSONSyntaxChar(kJSONZeroChar);
+// the UTF-16 code unit via out.
+uint32_t TJSONProtocol::readJSONEscapeChar(uint16_t* out) {
+  uint8_t b[4];
   b[0] = reader_.read();
   b[1] = reader_.read();
-  *out = (hexVal(b[0]) << 4) + hexVal(b[1]);
+  b[2] = reader_.read();
+  b[3] = reader_.read();
+
+  *out = (hexVal(b[0]) << 12)
+    + (hexVal(b[1]) << 8) + (hexVal(b[2]) << 4) + hexVal(b[3]);
+
   return 4;
 }
 
@@ -710,6 +738,7 @@ uint32_t TJSONProtocol::readJSONEscapeChar(uint8_t* out) {
 uint32_t TJSONProtocol::readJSONString(std::string& str, bool skipContext) {
   uint32_t result = (skipContext ? 0 : context_->read(reader_));
   result += readJSONSyntaxChar(kJSONStringDelimiter);
+  std::vector<uint16_t> codeunits;
   uint8_t ch;
   str.clear();
   while (true) {
@@ -722,7 +751,22 @@ uint32_t TJSONProtocol::readJSONString(std::string& str, bool skipContext) {
       ch = reader_.read();
       ++result;
       if (ch == kJSONEscapeChar) {
-        result += readJSONEscapeChar(&ch);
+        uint16_t cp;
+        result += readJSONEscapeChar(&cp);
+        if (isHighSurrogate(cp)) {
+          codeunits.push_back(cp);
+        } else {
+          if (isLowSurrogate(cp)
+               && codeunits.empty()) {
+            throw TProtocolException(TProtocolException::INVALID_DATA,
+                                     "Missing UTF-16 high surrogate pair.");
+          }
+          codeunits.push_back(cp);
+          codeunits.push_back(0);
+          str += boost::locale::conv::utf_to_utf<char>(codeunits.data());
+          codeunits.clear();
+        }
+        continue;
       } else {
         size_t pos = kEscapeChars.find(ch);
         if (pos == std::string::npos) {
@@ -733,7 +777,16 @@ uint32_t TJSONProtocol::readJSONString(std::string& str, bool skipContext) {
         ch = kEscapeCharVals[pos];
       }
     }
+    if (!codeunits.empty()) {
+      throw TProtocolException(TProtocolException::INVALID_DATA,
+                               "Missing UTF-16 low surrogate pair.");
+    }
     str += ch;
+  }
+
+  if (!codeunits.empty()) {
+    throw TProtocolException(TProtocolException::INVALID_DATA,
+                             "Missing UTF-16 low surrogate pair.");
   }
   return result;
 }
@@ -747,6 +800,13 @@ uint32_t TJSONProtocol::readJSONBase64(std::string& str) {
     throw TProtocolException(TProtocolException::SIZE_LIMIT);
   uint32_t len = static_cast<uint32_t>(tmp.length());
   str.clear();
+  // Ignore padding
+  if (len >= 2)  {
+    uint32_t bound = len - 2;
+    for (uint32_t i = len - 1; i >= bound && b[i] == '='; --i) {
+      --len;
+    }
+  }
   while (len >= 4) {
     base64_decode(b, 4);
     str.append((const char*)b, 3);
@@ -792,13 +852,25 @@ uint32_t TJSONProtocol::readJSONInteger(NumberType& num) {
   try {
     num = boost::lexical_cast<NumberType>(str);
   } catch (boost::bad_lexical_cast e) {
-    throw new TProtocolException(TProtocolException::INVALID_DATA,
+    throw TProtocolException(TProtocolException::INVALID_DATA,
                                  "Expected numeric value; got \"" + str + "\"");
   }
   if (context_->escapeNum()) {
     result += readJSONSyntaxChar(kJSONStringDelimiter);
   }
   return result;
+}
+
+namespace {
+double stringToDouble(const std::string& s) {
+  double d;
+  std::istringstream str(s);
+  str.imbue(std::locale::classic());
+  str >> d;
+  if (str.bad() || !str.eof())
+    throw std::runtime_error(s);
+  return d;
+}
 }
 
 // Reads a JSON number or string and interprets it as a double.
@@ -817,13 +889,13 @@ uint32_t TJSONProtocol::readJSONDouble(double& num) {
     } else {
       if (!context_->escapeNum()) {
         // Throw exception -- we should not be in a string in this case
-        throw new TProtocolException(TProtocolException::INVALID_DATA,
+        throw TProtocolException(TProtocolException::INVALID_DATA,
                                      "Numeric data unexpectedly quoted");
       }
       try {
-        num = boost::lexical_cast<double>(str);
-      } catch (boost::bad_lexical_cast e) {
-        throw new TProtocolException(TProtocolException::INVALID_DATA,
+        num = stringToDouble(str);
+      } catch (std::runtime_error e) {
+        throw TProtocolException(TProtocolException::INVALID_DATA,
                                      "Expected numeric value; got \"" + str + "\"");
       }
     }
@@ -834,9 +906,9 @@ uint32_t TJSONProtocol::readJSONDouble(double& num) {
     }
     result += readJSONNumericChars(str);
     try {
-      num = boost::lexical_cast<double>(str);
-    } catch (boost::bad_lexical_cast e) {
-      throw new TProtocolException(TProtocolException::INVALID_DATA,
+      num = stringToDouble(str);
+    } catch (std::runtime_error e) {
+      throw TProtocolException(TProtocolException::INVALID_DATA,
                                    "Expected numeric value; got \"" + str + "\"");
     }
   }

@@ -24,13 +24,14 @@ unit Thrift.Protocol.JSON;
 interface
 
 uses
+  Character,
   Classes,
   SysUtils,
   Math,
-  IdCoderMIME,
   Generics.Collections,
   Thrift.Transport,
-  Thrift.Protocol;
+  Thrift.Protocol,
+  Thrift.Utils;
 
 type
   IJSONProtocol = interface( IProtocol)
@@ -622,24 +623,29 @@ end;
 
 
 procedure TJSONProtocolImpl.WriteJSONBase64( const b : TBytes);
-var str : string;
-    tmp : TBytes;
-    i   : Integer;
+var len, off, cnt : Integer;
+    tmpBuf : TBytes;
 begin
   FContext.Write;
   Transport.Write( QUOTE);
 
-  // First base64-encode b, then write the resulting 8-bit chars
-  // Unfortunately, EncodeBytes() returns a string of 16-bit (wide) chars
-  // And for the sake of efficiency, we want to write everything at once
-  str := TIdEncoderMIME.EncodeBytes(b);
-  ASSERT( SizeOf(str[1]) = SizeOf(Word));
-  SetLength( tmp, Length(str));
-  for i := 1 to Length(str) do begin
-    ASSERT( Hi(Word(str[i])) = 0);   // base64 consists of a well-defined set of 8-bit chars only
-    tmp[i-1] := Lo(Word(str[i]));    // extract the lower byte
+  len := Length(b);
+  off := 0;
+  SetLength( tmpBuf, 4);
+
+  while len >= 3 do begin
+    // Encode 3 bytes at a time
+    Base64Utils.Encode( b, off, 3, tmpBuf, 0);
+    Transport.Write( tmpBuf, 0, 4);
+    Inc( off, 3);
+    Dec( len, 3);
   end;
-  Transport.Write( tmp);  // now write all the data
+
+  // Encode remainder, if any
+  if len > 0 then begin
+    cnt := Base64Utils.Encode( b, off, len, tmpBuf, 0);
+    Transport.Write( tmpBuf, 0, cnt);
+  end;
 
   Transport.Write( QUOTE);
 end;
@@ -816,9 +822,12 @@ function TJSONProtocolImpl.ReadJSONString( skipContext : Boolean) : TBytes;
 var buffer : TMemoryStream;
     ch  : Byte;
     wch : Word;
+    highSurogate: Char;
+    surrogatePairs: Array[0..1] of Char;
     off : Integer;
     tmp : TBytes;
 begin
+  highSurogate := #0;
   buffer := TMemoryStream.Create;
   try
     if not skipContext
@@ -857,10 +866,30 @@ begin
            + (HexVal(tmp[1]) shl 8)
            + (HexVal(tmp[2]) shl 4)
            +  HexVal(tmp[3]);
+
       // we need to make UTF8 bytes from it, to be decoded later
-      tmp := SysUtils.TEncoding.UTF8.GetBytes(Char(wch));
-      buffer.Write( tmp[0], length(tmp));
+      if Character.IsHighSurrogate(char(wch)) then begin
+        if highSurogate <> #0
+        then raise TProtocolException.Create( TProtocolException.INVALID_DATA, 'Expected low surrogate char');
+        highSurogate := char(wch);
+      end
+      else if Character.IsLowSurrogate(char(wch)) then begin
+        if highSurogate = #0
+        then TProtocolException.Create( TProtocolException.INVALID_DATA, 'Expected high surrogate char');
+        surrogatePairs[0] := highSurogate;
+        surrogatePairs[1] := char(wch);
+        tmp := TEncoding.UTF8.GetBytes(surrogatePairs);
+        buffer.Write( tmp[0], Length(tmp));
+        highSurogate := #0;
+      end
+      else begin
+        tmp := SysUtils.TEncoding.UTF8.GetBytes(Char(wch));
+        buffer.Write( tmp[0], Length(tmp));
+      end;
     end;
+
+    if highSurogate <> #0
+    then raise TProtocolException.Create( TProtocolException.INVALID_DATA, 'Expected low surrogate char');
 
     SetLength( result, buffer.Size);
     if buffer.Size > 0 then Move( buffer.Memory^, result[0], Length(result));
@@ -960,12 +989,37 @@ end;
 
 function TJSONProtocolImpl.ReadJSONBase64 : TBytes;
 var b : TBytes;
-    str : string;
+    len, off, size : Integer;
 begin
   b := ReadJSONString(false);
 
-  SetString( str, PAnsiChar(b), Length(b));
-  result := TIdDecoderMIME.DecodeBytes( str);
+  len := Length(b);
+  off := 0;
+  size := 0;
+
+  // reduce len to ignore fill bytes
+  Dec(len);
+  while (len >= 0) and (b[len] = Byte('=')) do Dec(len);
+  Inc(len);
+
+  // read & decode full byte triplets = 4 source bytes
+  while (len >= 4) do begin
+    // Decode 4 bytes at a time
+    Inc( size, Base64Utils.Decode( b, off, 4, b, size)); // decoded in place
+    Inc( off, 4);
+    Dec( len, 4);
+  end;
+
+  // Don't decode if we hit the end or got a single leftover byte (invalid
+  // base64 but legal for skip of regular string type)
+  if len > 1 then begin
+    // Decode remainder
+    Inc( size, Base64Utils.Decode( b, off, len, b, size)); // decoded in place
+  end;
+
+  // resize to final size and return the data
+  SetLength( b, size);
+  result := b;
 end;
 
 

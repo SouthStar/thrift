@@ -18,6 +18,9 @@
 #
 AUTOMAKE_OPTIONS = subdir-objects serial-tests
 
+BUILT_SOURCES = gen-cpp/shared_types.cpp \
+                gen-cpp/tutorial_types.cpp
+
 noinst_LTLIBRARIES = libtutorialgencpp.la
 nodist_libtutorialgencpp_la_SOURCES = \
 	gen-cpp/Calculator.cpp \
@@ -68,7 +71,7 @@ AM_CXXFLAGS = -Wall -Wextra -pedantic
 AM_LDFLAGS = $(BOOST_LDFLAGS) $(LIBEVENT_LDFLAGS)
 
 clean-local:
-	$(RM) -r gen-cpp
+	$(RM) gen-cpp/*
 
 tutorialserver: all
 	./TutorialServer
@@ -80,5 +83,6 @@ style-local:
 	$(CPPSTYLE_CMD)
 
 EXTRA_DIST = \
+	CMakeLists.txt \
 	CppClient.cpp \
 	CppServer.cpp

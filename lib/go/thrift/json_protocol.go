@@ -69,7 +69,7 @@ func (p *TJSONProtocol) WriteMessageBegin(name string, typeId TMessageType, seqI
 	if e := p.WriteString(name); e != nil {
 		return e
 	}
-	if e := p.WriteByte(byte(typeId)); e != nil {
+	if e := p.WriteByte(int8(typeId)); e != nil {
 		return e
 	}
 	if e := p.WriteI32(seqId); e != nil {
@@ -134,10 +134,16 @@ func (p *TJSONProtocol) WriteMapBegin(keyType TType, valueType TType, size int) 
 	if e := p.WriteString(s); e != nil {
 		return e
 	}
-	return p.WriteI64(int64(size))
+	if e := p.WriteI64(int64(size)); e != nil {
+		return e
+	}
+	return p.OutputObjectBegin()
 }
 
 func (p *TJSONProtocol) WriteMapEnd() error {
+	if e := p.OutputObjectEnd(); e != nil {
+		return e
+	}
 	return p.OutputListEnd()
 }
 
@@ -164,7 +170,7 @@ func (p *TJSONProtocol) WriteBool(b bool) error {
 	return p.WriteI32(0)
 }
 
-func (p *TJSONProtocol) WriteByte(b byte) error {
+func (p *TJSONProtocol) WriteByte(b int8) error {
 	return p.WriteI32(int32(b))
 }
 
@@ -304,12 +310,21 @@ func (p *TJSONProtocol) ReadMapBegin() (keyType TType, valueType TType, size int
 	}
 
 	// read size
-	iSize, err := p.ReadI64()
+	iSize, e := p.ReadI64()
+	if e != nil {
+		return keyType, valueType, size, e
+	}
 	size = int(iSize)
-	return keyType, valueType, size, err
+
+	_, e = p.ParseObjectStart()
+	return keyType, valueType, size, e
 }
 
 func (p *TJSONProtocol) ReadMapEnd() error {
+	e := p.ParseObjectEnd()
+	if e != nil {
+		return e
+	}
 	return p.ParseListEnd()
 }
 
@@ -334,9 +349,9 @@ func (p *TJSONProtocol) ReadBool() (bool, error) {
 	return (value != 0), err
 }
 
-func (p *TJSONProtocol) ReadByte() (byte, error) {
+func (p *TJSONProtocol) ReadByte() (int8, error) {
 	v, err := p.ReadI64()
-	return byte(v), err
+	return int8(v), err
 }
 
 func (p *TJSONProtocol) ReadI16() (int16, error) {
@@ -372,7 +387,7 @@ func (p *TJSONProtocol) ReadString() (string, error) {
 		if err != nil {
 			return v, err
 		}
-	} else if len(f) >= 0 && f[0] == JSON_NULL[0] {
+	} else if len(f) > 0 && f[0] == JSON_NULL[0] {
 		b := make([]byte, len(JSON_NULL))
 		_, err := p.reader.Read(b)
 		if err != nil {
@@ -402,7 +417,7 @@ func (p *TJSONProtocol) ReadBinary() ([]byte, error) {
 		if err != nil {
 			return v, err
 		}
-	} else if len(f) >= 0 && f[0] == JSON_NULL[0] {
+	} else if len(f) > 0 && f[0] == JSON_NULL[0] {
 		b := make([]byte, len(JSON_NULL))
 		_, err := p.reader.Read(b)
 		if err != nil {

@@ -162,7 +162,7 @@ func (p *TSimpleJSONProtocol) WriteMessageBegin(name string, typeId TMessageType
 	if e := p.WriteString(name); e != nil {
 		return e
 	}
-	if e := p.WriteByte(byte(typeId)); e != nil {
+	if e := p.WriteByte(int8(typeId)); e != nil {
 		return e
 	}
 	if e := p.WriteI32(seqId); e != nil {
@@ -204,10 +204,10 @@ func (p *TSimpleJSONProtocol) WriteMapBegin(keyType TType, valueType TType, size
 	if e := p.OutputListBegin(); e != nil {
 		return e
 	}
-	if e := p.WriteByte(byte(keyType)); e != nil {
+	if e := p.WriteByte(int8(keyType)); e != nil {
 		return e
 	}
-	if e := p.WriteByte(byte(valueType)); e != nil {
+	if e := p.WriteByte(int8(valueType)); e != nil {
 		return e
 	}
 	return p.WriteI32(int32(size))
@@ -237,7 +237,7 @@ func (p *TSimpleJSONProtocol) WriteBool(b bool) error {
 	return p.OutputBool(b)
 }
 
-func (p *TSimpleJSONProtocol) WriteByte(b byte) error {
+func (p *TSimpleJSONProtocol) WriteByte(b int8) error {
 	return p.WriteI32(int32(b))
 }
 
@@ -463,9 +463,9 @@ func (p *TSimpleJSONProtocol) ReadBool() (bool, error) {
 	return value, p.ParsePostValue()
 }
 
-func (p *TSimpleJSONProtocol) ReadByte() (byte, error) {
+func (p *TSimpleJSONProtocol) ReadByte() (int8, error) {
 	v, err := p.ReadI64()
-	return byte(v), err
+	return int8(v), err
 }
 
 func (p *TSimpleJSONProtocol) ReadI16() (int16, error) {
@@ -501,7 +501,7 @@ func (p *TSimpleJSONProtocol) ReadString() (string, error) {
 		if err != nil {
 			return v, err
 		}
-	} else if len(f) >= 0 && f[0] == JSON_NULL[0] {
+	} else if len(f) > 0 && f[0] == JSON_NULL[0] {
 		b := make([]byte, len(JSON_NULL))
 		_, err := p.reader.Read(b)
 		if err != nil {
@@ -531,7 +531,7 @@ func (p *TSimpleJSONProtocol) ReadBinary() ([]byte, error) {
 		if err != nil {
 			return v, err
 		}
-	} else if len(f) >= 0 && f[0] == JSON_NULL[0] {
+	} else if len(f) > 0 && f[0] == JSON_NULL[0] {
 		b := make([]byte, len(JSON_NULL))
 		_, err := p.reader.Read(b)
 		if err != nil {
@@ -736,7 +736,7 @@ func (p *TSimpleJSONProtocol) OutputElemListBegin(elemType TType, size int) erro
 	if e := p.OutputListBegin(); e != nil {
 		return e
 	}
-	if e := p.WriteByte(byte(elemType)); e != nil {
+	if e := p.WriteByte(int8(elemType)); e != nil {
 		return e
 	}
 	if e := p.WriteI64(int64(size)); e != nil {
@@ -909,6 +909,12 @@ func (p *TSimpleJSONProtocol) ParseBase64EncodedBody() ([]byte, error) {
 	}
 	line2 := line[0 : len(line)-1]
 	l := len(line2)
+	if (l % 4) != 0 {
+		pad := 4 - (l % 4)
+		fill := [...]byte{'=', '=', '='}
+		line2 = append(line2, fill[:pad]...)
+		l = len(line2)
+	}
 	output := make([]byte, base64.StdEncoding.DecodedLen(l))
 	n, err := base64.StdEncoding.Decode(output, line2)
 	return output[0:n], NewTProtocolException(err)
@@ -983,8 +989,8 @@ func (p *TSimpleJSONProtocol) ParseObjectEnd() error {
 		return err
 	}
 	cxt := _ParseContext(p.parseContextStack[len(p.parseContextStack)-1])
-	if cxt != _CONTEXT_IN_OBJECT_FIRST && cxt != _CONTEXT_IN_OBJECT_NEXT_KEY {
-		e := fmt.Errorf("Expected to be in the Object Context, but not in Object Context")
+	if (cxt != _CONTEXT_IN_OBJECT_FIRST) && (cxt != _CONTEXT_IN_OBJECT_NEXT_KEY) {
+		e := fmt.Errorf("Expected to be in the Object Context, but not in Object Context (%d)", cxt)
 		return NewTProtocolExceptionWithType(INVALID_DATA, e)
 	}
 	line, err := p.reader.ReadString(JSON_RBRACE[0])
@@ -1043,8 +1049,9 @@ func (p *TSimpleJSONProtocol) ParseListEnd() error {
 	if isNull, err := p.readIfNull(); isNull || err != nil {
 		return err
 	}
-	if _ParseContext(p.parseContextStack[len(p.parseContextStack)-1]) != _CONTEXT_IN_LIST {
-		e := fmt.Errorf("Expected to be in the List Context, but not in List Context")
+	cxt := _ParseContext(p.parseContextStack[len(p.parseContextStack)-1])
+	if cxt != _CONTEXT_IN_LIST {
+		e := fmt.Errorf("Expected to be in the List Context, but not in List Context (%d)", cxt)
 		return NewTProtocolExceptionWithType(INVALID_DATA, e)
 	}
 	line, err := p.reader.ReadString(JSON_RBRACKET[0])
